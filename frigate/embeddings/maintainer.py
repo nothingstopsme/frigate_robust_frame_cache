@@ -428,40 +428,35 @@ class EmbeddingMaintainer(threading.Thread):
             return
 
         # Create our own thumbnail based on the bounding box and the frame time
-        try:
-            yuv_frame = self.frame_manager.get(
-                frame_name, camera_config.frame_shape_yuv
-            )
-        except FileNotFoundError:
-            logger.debug(f"Frame {frame_name} not found for camera {camera}")
-            pass
-
-        if yuv_frame is None:
-            logger.debug(
-                "Unable to process object update because frame is unavailable."
-            )
-            return
-
-        logger.debug(
-            f"Processing {len(self.realtime_processors)} realtime processors for object {data.get('id')} (label: {data.get('label')})"
-        )
-        for processor in self.realtime_processors:
-            logger.debug(f"Calling process_frame on {processor.__class__.__name__}")
-            processor.process_frame(data, yuv_frame)
-
-        for processor in self.post_processors:
-            if isinstance(processor, ObjectDescriptionProcessor):
-                processor.process_data(
-                    {
-                        "camera": camera,
-                        "data": data,
-                        "state": "update",
-                        "yuv_frame": yuv_frame,
-                    },
-                    PostProcessDataEnum.tracked_object,
+        with self.frame_manager.read(
+            frame_name, camera_config.frame_shape_yuv
+        ) as yuv_frame:
+            if yuv_frame is None:
+                logger.debug(
+                    "Unable to process object update because frame is unavailable."
                 )
+                return
 
-        self.frame_manager.close(frame_name)
+            yuv_frame = yuv_frame.buffer
+
+            logger.debug(
+                f"Processing {len(self.realtime_processors)} realtime processors for object {data.get('id')} (label: {data.get('label')})"
+            )
+            for processor in self.realtime_processors:
+                logger.debug(f"Calling process_frame on {processor.__class__.__name__}")
+                processor.process_frame(data, yuv_frame)
+
+            for processor in self.post_processors:
+                if isinstance(processor, ObjectDescriptionProcessor):
+                    processor.process_data(
+                        {
+                            "camera": camera,
+                            "data": data,
+                            "state": "update",
+                            "yuv_frame": yuv_frame,
+                        },
+                        PostProcessDataEnum.tracked_object,
+                    )
 
     def _process_finalized(self) -> None:
         """Process the end of an event."""
@@ -646,33 +641,29 @@ class EmbeddingMaintainer(threading.Thread):
             # no active features that use this data
             return
 
-        try:
-            yuv_frame = self.frame_manager.get(
-                frame_name, camera_config.frame_shape_yuv
-            )
-        except FileNotFoundError:
-            pass
-
-        if yuv_frame is None:
-            logger.debug(
-                "Unable to process dedicated LPR update because frame is unavailable."
-            )
-            return
-
-        for processor in self.realtime_processors:
-            if (
-                dedicated_lpr_enabled
-                and len(motion_boxes) > 0
-                and isinstance(processor, LicensePlateRealTimeProcessor)
-            ):
-                processor.process_frame(camera, yuv_frame, True)
-
-            if isinstance(processor, CustomStateClassificationProcessor):
-                processor.process_frame(
-                    {"camera": camera, "motion": motion_boxes}, yuv_frame
+        with self.frame_manager.read(
+            frame_name, camera_config.frame_shape_yuv
+        ) as yuv_frame:
+            if yuv_frame is None:
+                logger.debug(
+                    "Unable to process dedicated LPR update because frame is unavailable."
                 )
+                return
 
-        self.frame_manager.close(frame_name)
+            yuv_frame = yuv_frame.buffer
+
+            for processor in self.realtime_processors:
+                if (
+                    dedicated_lpr_enabled
+                    and len(motion_boxes) > 0
+                    and isinstance(processor, LicensePlateRealTimeProcessor)
+                ):
+                    processor.process_frame(camera, yuv_frame, True)
+
+                if isinstance(processor, CustomStateClassificationProcessor):
+                    processor.process_frame(
+                        {"camera": camera, "motion": motion_boxes}, yuv_frame
+                    )
 
     def _embed_thumbnail(self, event_id: str, thumbnail: bytes) -> None:
         """Embed the thumbnail for an event."""

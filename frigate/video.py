@@ -121,10 +121,16 @@ def capture_frames(
         None, {config.name: config}, [CameraConfigUpdateEnum.enabled]
     )
 
+    local_frame_buffer = bytearray(frame_size)
+
     def get_enabled_state():
         """Fetch the latest enabled state from ZMQ."""
         config_subscriber.check_for_updates()
         return config.enabled
+
+    def next_frame_index():
+        nonlocal shm_frame_count, frame_index
+        frame_index = 0 if frame_index == shm_frame_count - 1 else frame_index + 1
 
     try:
         while not stop_event.is_set():
@@ -135,10 +141,18 @@ def capture_frames(
             fps.value = frame_rate.eps()
             skipped_fps.value = skipped_eps.eps()
             current_frame.value = datetime.now().timestamp()
-            frame_name = f"{config.name}_frame{frame_index}"
-            frame_buffer = frame_manager.write(frame_name)
+            shm_name = f"{config.name}_frame{frame_index}"
             try:
-                frame_buffer[:] = ffmpeg_process.stdout.read(frame_size)
+                # Reading data from stdout in a more robust way,
+                # as stdout.read()/stdout.readinto() does not guarantee that the number of returned bytes
+                # is always equal to the requested size
+                local_frame_view = memoryview(local_frame_buffer)
+                while local_frame_view.nbytes > 0:
+                    nbytes = ffmpeg_process.stdout.readinto(local_frame_view)
+                    if nbytes == 0:
+                        raise EOFError()
+                    else:
+                        local_frame_view = local_frame_view[nbytes:]
             except Exception:
                 # shutdown has been initiated
                 if stop_event.is_set():
@@ -158,16 +172,33 @@ def capture_frames(
 
             frame_rate.update()
 
+            # Note: frame_index is advanced only when
+            # 1. one new frame has been written to the indexed shm block and its (frame_name, frame_time) info pair has been put into frame_queue successfully.
+            # 2. the indexed shm block has been found currently busy.
+            #
+            # Compared with the previous strategy of jumping to next block at the end of every iteration, this should help to keep available blocks more accessable.
+
+            with frame_manager.write(shm_name) as frame_handle:
+                if not frame_handle:
+                    logger.warning(
+                        f"{config.name}: skipping an incoming frame as it is set to be stored in a busy shm block."
+                    )
+                    skipped_eps.update()
+                    next_frame_index()
+                    continue
+
+                frame_name = frame_handle.name_comps.to_str()
+                frame_handle.buffer[:] = local_frame_buffer
+
             # don't lock the queue to check, just try since it should rarely be full
             try:
                 # add to the queue
                 frame_queue.put((frame_name, current_frame.value), False)
-                frame_manager.close(frame_name)
+                next_frame_index()
             except queue.Full:
                 # if the queue is full, skip this frame
                 skipped_eps.update()
 
-            frame_index = 0 if frame_index == shm_frame_count - 1 else frame_index + 1
     finally:
         config_subscriber.stop()
 
@@ -840,256 +871,267 @@ def process_frames(
         camera_metrics.detection_frame.value = frame_time
         ptz_metrics.frame_time.value = frame_time
 
-        frame = frame_manager.get(frame_name, (frame_shape[0] * 3 // 2, frame_shape[1]))
+        # Since the frame cache writer can only write at most n frames at this moment (n is the max size of frame_queue),
+        # when the size of frame cache is at least 2 times as large as n,
+        # the data integrity of the retrieved frame can be guaranteed and thus no synchronization is needed
+        with frame_manager.read(
+            frame_name, (frame_shape[0] * 3 // 2, frame_shape[1]), synchronize=False
+        ) as frame:
+            if frame is None:
+                logger.debug(
+                    f"{camera_config.name}: frame {frame_time} is not in memory store."
+                )
+                continue
 
-        if frame is None:
-            logger.debug(
-                f"{camera_config.name}: frame {frame_time} is not in memory store."
-            )
-            continue
+            frame = frame.buffer
 
-        # look for motion if enabled
-        motion_boxes = motion_detector.detect(frame)
+            # look for motion if enabled
+            motion_boxes = motion_detector.detect(frame)
 
-        regions = []
-        consolidated_detections = []
+            regions = []
+            consolidated_detections = []
 
-        # if detection is disabled
-        if not camera_config.detect.enabled:
-            object_tracker.match_and_update(frame_name, frame_time, [])
-        else:
-            # get stationary object ids
-            # check every Nth frame for stationary objects
-            # disappeared objects are not stationary
-            # also check for overlapping motion boxes
-            if stationary_frame_counter == camera_config.detect.stationary.interval:
-                stationary_frame_counter = 0
-                stationary_object_ids = []
+            # if detection is disabled
+            if not camera_config.detect.enabled:
+                object_tracker.match_and_update(frame_name, frame_time, [])
             else:
-                stationary_frame_counter += 1
-                stationary_object_ids = [
-                    obj["id"]
+                # get stationary object ids
+                # check every Nth frame for stationary objects
+                # disappeared objects are not stationary
+                # also check for overlapping motion boxes
+                if stationary_frame_counter == camera_config.detect.stationary.interval:
+                    stationary_frame_counter = 0
+                    stationary_object_ids = []
+                else:
+                    stationary_frame_counter += 1
+                    stationary_object_ids = [
+                        obj["id"]
+                        for obj in object_tracker.tracked_objects.values()
+                        # if it has exceeded the stationary threshold
+                        if obj["motionless_count"]
+                        >= camera_config.detect.stationary.threshold
+                        # and it hasn't disappeared
+                        and object_tracker.disappeared[obj["id"]] == 0
+                        # and it doesn't overlap with any current motion boxes when not calibrating
+                        and not intersects_any(
+                            obj["box"],
+                            [] if motion_detector.is_calibrating() else motion_boxes,
+                        )
+                    ]
+
+                # get tracked object boxes that aren't stationary
+                tracked_object_boxes = [
+                    (
+                        # use existing object box for stationary objects
+                        obj["estimate"]
+                        if obj["motionless_count"]
+                        < camera_config.detect.stationary.threshold
+                        else obj["box"]
+                    )
                     for obj in object_tracker.tracked_objects.values()
-                    # if it has exceeded the stationary threshold
-                    if obj["motionless_count"]
-                    >= camera_config.detect.stationary.threshold
-                    # and it hasn't disappeared
-                    and object_tracker.disappeared[obj["id"]] == 0
-                    # and it doesn't overlap with any current motion boxes when not calibrating
-                    and not intersects_any(
-                        obj["box"],
-                        [] if motion_detector.is_calibrating() else motion_boxes,
+                    if obj["id"] not in stationary_object_ids
+                ]
+                object_boxes = (
+                    tracked_object_boxes + object_tracker.untracked_object_boxes
+                )
+
+                # get consolidated regions for tracked objects
+                regions = [
+                    get_cluster_region(
+                        frame_shape, region_min_size, candidate, object_boxes
+                    )
+                    for candidate in get_cluster_candidates(
+                        frame_shape, region_min_size, object_boxes
                     )
                 ]
 
-            # get tracked object boxes that aren't stationary
-            tracked_object_boxes = [
-                (
-                    # use existing object box for stationary objects
-                    obj["estimate"]
-                    if obj["motionless_count"]
-                    < camera_config.detect.stationary.threshold
-                    else obj["box"]
-                )
-                for obj in object_tracker.tracked_objects.values()
-                if obj["id"] not in stationary_object_ids
-            ]
-            object_boxes = tracked_object_boxes + object_tracker.untracked_object_boxes
-
-            # get consolidated regions for tracked objects
-            regions = [
-                get_cluster_region(
-                    frame_shape, region_min_size, candidate, object_boxes
-                )
-                for candidate in get_cluster_candidates(
-                    frame_shape, region_min_size, object_boxes
-                )
-            ]
-
-            # only add in the motion boxes when not calibrating and a ptz is not moving via autotracking
-            # ptz_moving_at_frame_time() always returns False for non-autotracking cameras
-            if not motion_detector.is_calibrating() and not ptz_moving_at_frame_time(
-                frame_time,
-                ptz_metrics.start_time.value,
-                ptz_metrics.stop_time.value,
-            ):
-                # find motion boxes that are not inside tracked object regions
-                standalone_motion_boxes = [
-                    b for b in motion_boxes if not inside_any(b, regions)
-                ]
-
-                if standalone_motion_boxes:
-                    motion_clusters = get_cluster_candidates(
-                        frame_shape,
-                        region_min_size,
-                        standalone_motion_boxes,
+                # only add in the motion boxes when not calibrating and a ptz is not moving via autotracking
+                # ptz_moving_at_frame_time() always returns False for non-autotracking cameras
+                if (
+                    not motion_detector.is_calibrating()
+                    and not ptz_moving_at_frame_time(
+                        frame_time,
+                        ptz_metrics.start_time.value,
+                        ptz_metrics.stop_time.value,
                     )
-                    motion_regions = [
-                        get_cluster_region_from_grid(
+                ):
+                    # find motion boxes that are not inside tracked object regions
+                    standalone_motion_boxes = [
+                        b for b in motion_boxes if not inside_any(b, regions)
+                    ]
+
+                    if standalone_motion_boxes:
+                        motion_clusters = get_cluster_candidates(
                             frame_shape,
                             region_min_size,
-                            candidate,
                             standalone_motion_boxes,
-                            region_grid,
                         )
-                        for candidate in motion_clusters
-                    ]
-                    regions += motion_regions
+                        motion_regions = [
+                            get_cluster_region_from_grid(
+                                frame_shape,
+                                region_min_size,
+                                candidate,
+                                standalone_motion_boxes,
+                                region_grid,
+                            )
+                            for candidate in motion_clusters
+                        ]
+                        regions += motion_regions
 
-            # if starting up, get the next startup scan region
-            if startup_scan:
-                for region in get_startup_regions(
-                    frame_shape, region_min_size, region_grid
-                ):
-                    regions.append(region)
-                startup_scan = False
+                # if starting up, get the next startup scan region
+                if startup_scan:
+                    for region in get_startup_regions(
+                        frame_shape, region_min_size, region_grid
+                    ):
+                        regions.append(region)
+                    startup_scan = False
 
-            # resize regions and detect
-            # seed with stationary objects
-            detections = [
-                (
-                    obj["label"],
-                    obj["score"],
-                    obj["box"],
-                    obj["area"],
-                    obj["ratio"],
-                    obj["region"],
-                )
-                for obj in object_tracker.tracked_objects.values()
-                if obj["id"] in stationary_object_ids
-            ]
-
-            for region in regions:
-                detections.extend(
-                    detect(
-                        camera_config.detect,
-                        object_detector,
-                        frame,
-                        model_config,
-                        region,
-                        camera_config.objects.track,
-                        camera_config.objects.filters,
+                # resize regions and detect
+                # seed with stationary objects
+                detections = [
+                    (
+                        obj["label"],
+                        obj["score"],
+                        obj["box"],
+                        obj["area"],
+                        obj["ratio"],
+                        obj["region"],
                     )
-                )
-
-            consolidated_detections = reduce_detections(frame_shape, detections)
-
-            # if detection was run on this frame, consolidate
-            if len(regions) > 0:
-                tracked_detections = [
-                    d for d in consolidated_detections if d[0] not in all_attributes
+                    for obj in object_tracker.tracked_objects.values()
+                    if obj["id"] in stationary_object_ids
                 ]
-                # now that we have refined our detections, we need to track objects
-                object_tracker.match_and_update(
-                    frame_name, frame_time, tracked_detections
-                )
-            # else, just update the frame times for the stationary objects
-            else:
-                object_tracker.update_frame_times(frame_name, frame_time)
 
-        # group the attribute detections based on what label they apply to
-        attribute_detections: dict[str, list[TrackedObjectAttribute]] = {}
-        for label, attribute_labels in attributes_map.items():
-            attribute_detections[label] = [
-                TrackedObjectAttribute(d)
-                for d in consolidated_detections
-                if d[0] in attribute_labels
-            ]
-
-        # build detections
-        detections = {}
-        for obj in object_tracker.tracked_objects.values():
-            detections[obj["id"]] = {**obj, "attributes": []}
-
-        # find the best object for each attribute to be assigned to
-        all_objects: list[dict[str, Any]] = object_tracker.tracked_objects.values()
-        for attributes in attribute_detections.values():
-            for attribute in attributes:
-                filtered_objects = filter(
-                    lambda o: attribute.label in attributes_map.get(o["label"], []),
-                    all_objects,
-                )
-                selected_object_id = attribute.find_best_object(filtered_objects)
-
-                if selected_object_id is not None:
-                    detections[selected_object_id]["attributes"].append(
-                        attribute.get_tracking_data()
+                for region in regions:
+                    detections.extend(
+                        detect(
+                            camera_config.detect,
+                            object_detector,
+                            frame,
+                            model_config,
+                            region,
+                            camera_config.objects.track,
+                            camera_config.objects.filters,
+                        )
                     )
 
-        # debug object tracking
-        if False:
-            bgr_frame = cv2.cvtColor(
-                frame,
-                cv2.COLOR_YUV2BGR_I420,
-            )
-            object_tracker.debug_draw(bgr_frame, frame_time)
-            cv2.imwrite(
-                f"debug/frames/track-{'{:.6f}'.format(frame_time)}.jpg", bgr_frame
-            )
-        # debug
-        if False:
-            bgr_frame = cv2.cvtColor(
-                frame,
-                cv2.COLOR_YUV2BGR_I420,
-            )
+                consolidated_detections = reduce_detections(frame_shape, detections)
 
-            for m_box in motion_boxes:
-                cv2.rectangle(
-                    bgr_frame,
-                    (m_box[0], m_box[1]),
-                    (m_box[2], m_box[3]),
-                    (0, 0, 255),
-                    2,
-                )
-
-            for b in tracked_object_boxes:
-                cv2.rectangle(
-                    bgr_frame,
-                    (b[0], b[1]),
-                    (b[2], b[3]),
-                    (255, 0, 0),
-                    2,
-                )
-
-            for obj in object_tracker.tracked_objects.values():
-                if obj["frame_time"] == frame_time:
-                    thickness = 2
-                    color = model_config.colormap.get(obj["label"], (255, 255, 255))
+                # if detection was run on this frame, consolidate
+                if len(regions) > 0:
+                    tracked_detections = [
+                        d for d in consolidated_detections if d[0] not in all_attributes
+                    ]
+                    # now that we have refined our detections, we need to track objects
+                    object_tracker.match_and_update(
+                        frame_name, frame_time, tracked_detections
+                    )
+                # else, just update the frame times for the stationary objects
                 else:
-                    thickness = 1
-                    color = (255, 0, 0)
+                    object_tracker.update_frame_times(frame_name, frame_time)
 
-                # draw the bounding boxes on the frame
-                box = obj["box"]
+            # group the attribute detections based on what label they apply to
+            attribute_detections: dict[str, list[TrackedObjectAttribute]] = {}
+            for label, attribute_labels in attributes_map.items():
+                attribute_detections[label] = [
+                    TrackedObjectAttribute(d)
+                    for d in consolidated_detections
+                    if d[0] in attribute_labels
+                ]
 
-                draw_box_with_label(
-                    bgr_frame,
-                    box[0],
-                    box[1],
-                    box[2],
-                    box[3],
-                    obj["label"],
-                    obj["id"],
-                    thickness=thickness,
-                    color=color,
+            # build detections
+            detections = {}
+            for obj in object_tracker.tracked_objects.values():
+                detections[obj["id"]] = {**obj, "attributes": []}
+
+            # find the best object for each attribute to be assigned to
+            all_objects: list[dict[str, Any]] = object_tracker.tracked_objects.values()
+            for attributes in attribute_detections.values():
+                for attribute in attributes:
+                    filtered_objects = filter(
+                        lambda o: attribute.label in attributes_map.get(o["label"], []),
+                        all_objects,
+                    )
+                    selected_object_id = attribute.find_best_object(filtered_objects)
+
+                    if selected_object_id is not None:
+                        detections[selected_object_id]["attributes"].append(
+                            attribute.get_tracking_data()
+                        )
+
+            # debug object tracking
+            if False:
+                bgr_frame = cv2.cvtColor(
+                    frame,
+                    cv2.COLOR_YUV2BGR_I420,
+                )
+                object_tracker.debug_draw(bgr_frame, frame_time)
+                cv2.imwrite(
+                    f"debug/frames/track-{'{:.6f}'.format(frame_time)}.jpg", bgr_frame
+                )
+            # debug
+            if False:
+                bgr_frame = cv2.cvtColor(
+                    frame,
+                    cv2.COLOR_YUV2BGR_I420,
                 )
 
-            for region in regions:
-                cv2.rectangle(
+                for m_box in motion_boxes:
+                    cv2.rectangle(
+                        bgr_frame,
+                        (m_box[0], m_box[1]),
+                        (m_box[2], m_box[3]),
+                        (0, 0, 255),
+                        2,
+                    )
+
+                for b in tracked_object_boxes:
+                    cv2.rectangle(
+                        bgr_frame,
+                        (b[0], b[1]),
+                        (b[2], b[3]),
+                        (255, 0, 0),
+                        2,
+                    )
+
+                for obj in object_tracker.tracked_objects.values():
+                    if obj["frame_time"] == frame_time:
+                        thickness = 2
+                        color = model_config.colormap.get(obj["label"], (255, 255, 255))
+                    else:
+                        thickness = 1
+                        color = (255, 0, 0)
+
+                    # draw the bounding boxes on the frame
+                    box = obj["box"]
+
+                    draw_box_with_label(
+                        bgr_frame,
+                        box[0],
+                        box[1],
+                        box[2],
+                        box[3],
+                        obj["label"],
+                        obj["id"],
+                        thickness=thickness,
+                        color=color,
+                    )
+
+                for region in regions:
+                    cv2.rectangle(
+                        bgr_frame,
+                        (region[0], region[1]),
+                        (region[2], region[3]),
+                        (0, 255, 0),
+                        2,
+                    )
+
+                cv2.imwrite(
+                    f"debug/frames/{camera_config.name}-{'{:.6f}'.format(frame_time)}.jpg",
                     bgr_frame,
-                    (region[0], region[1]),
-                    (region[2], region[3]),
-                    (0, 255, 0),
-                    2,
                 )
 
-            cv2.imwrite(
-                f"debug/frames/{camera_config.name}-{'{:.6f}'.format(frame_time)}.jpg",
-                bgr_frame,
-            )
         # add to the queue if not full
         if detected_objects_queue.full():
-            frame_manager.close(frame_name)
             continue
         else:
             fps_tracker.update()
@@ -1105,7 +1147,6 @@ def process_frames(
                 )
             )
             camera_metrics.detection_fps.value = object_detector.fps.eps()
-            frame_manager.close(frame_name)
 
     motion_detector.stop()
     requestor.stop()

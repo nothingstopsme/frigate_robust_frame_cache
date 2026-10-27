@@ -108,21 +108,21 @@ class CameraMaintainer(threading.Thread):
                 max(self.config.model.width, self.config.model.height),
             )
 
+            largest_frame = max(
+                [
+                    det.model.height * det.model.width * 3
+                    if det.model is not None
+                    else 320
+                    for det in self.config.detectors.values()
+                ]
+            )
+            # The current implementation retrieves detectors' input frames through
+            # SharedMemoryFrameManager inside object_processing/base.py; for consistency
+            # the frame cache are created via SharedMemoryFrameManager as well
+            self.frame_manager.create(name, largest_frame)
+
             try:
-                largest_frame = max(
-                    [
-                        det.model.height * det.model.width * 3
-                        if det.model is not None
-                        else 320
-                        for det in self.config.detectors.values()
-                    ]
-                )
                 UntrackedSharedMemory(name=f"out-{name}", create=True, size=20 * 6 * 4)
-                UntrackedSharedMemory(
-                    name=name,
-                    create=True,
-                    size=largest_frame,
-                )
             except FileExistsError:
                 pass
 

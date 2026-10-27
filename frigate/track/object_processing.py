@@ -344,10 +344,14 @@ class TrackedObjectProcessor(threading.Thread):
         self, camera: str, draw_options: dict[str, Any] = {}
     ) -> np.ndarray | None:
         if camera == "birdseye":
-            return self.frame_manager.get(
+            with self.frame_manager.read(
                 "birdseye",
                 (self.config.birdseye.height * 3 // 2, self.config.birdseye.width),
-            )
+            ) as frame_handle:
+                if frame_handle:
+                    return np.copy(frame_handle.buffer)
+                else:
+                    return None
 
         if camera not in self.camera_states:
             return None

@@ -74,7 +74,7 @@ from frigate.storage import StorageMaintainer
 from frigate.timeline import TimelineProcessor
 from frigate.track.object_processing import TrackedObjectProcessor
 from frigate.util.builtin import empty_and_close_queue
-from frigate.util.image import UntrackedSharedMemory
+from frigate.util.image import SharedMemoryFrameManager, UntrackedSharedMemory
 from frigate.util.services import set_file_limit
 from frigate.version import VERSION
 from frigate.watchdog import FrigateWatchdog
@@ -92,6 +92,7 @@ class FrigateApp:
         self.detection_queue: Queue = mp.Queue()
         self.detectors: dict[str, ObjectDetectProcess] = {}
         self.detection_shms: list[mp.shared_memory.SharedMemory] = []
+        self.frame_manager: SharedMemoryFrameManager = SharedMemoryFrameManager()
         self.log_queue: Queue = mp.Queue()
         self.camera_metrics: DictProxy = self.metrics_manager.dict()
         self.embeddings_metrics: DataProcessorMetrics | None = (
@@ -343,22 +344,18 @@ class FrigateApp:
 
     def start_detectors(self) -> None:
         for name in self.config.cameras.keys():
-            try:
-                largest_frame = max(
-                    [
-                        det.model.height * det.model.width * 3
-                        if det.model is not None
-                        else 320
-                        for det in self.config.detectors.values()
-                    ]
-                )
-                shm_in = UntrackedSharedMemory(
-                    name=name,
-                    create=True,
-                    size=largest_frame,
-                )
-            except FileExistsError:
-                shm_in = UntrackedSharedMemory(name=name)
+            largest_frame = max(
+                [
+                    det.model.height * det.model.width * 3
+                    if det.model is not None
+                    else 320
+                    for det in self.config.detectors.values()
+                ]
+            )
+            # The current implementation retrieves detectors' input frames through
+            # SharedMemoryFrameManager inside object_processing/base.py; for consistency
+            # the frame cache are created via SharedMemoryFrameManager as well
+            self.frame_manager.create(name, largest_frame)
 
             try:
                 shm_out = UntrackedSharedMemory(
@@ -367,7 +364,6 @@ class FrigateApp:
             except FileExistsError:
                 shm_out = UntrackedSharedMemory(name=f"out-{name}")
 
-            self.detection_shms.append(shm_in)
             self.detection_shms.append(shm_out)
 
         for name, detector_config in self.config.detectors.items():
@@ -654,6 +650,7 @@ class FrigateApp:
             shm = self.detection_shms.pop()
             shm.close()
             shm.unlink()
+        self.frame_manager.cleanup()
 
         _stop_logging()
         self.metrics_manager.shutdown()

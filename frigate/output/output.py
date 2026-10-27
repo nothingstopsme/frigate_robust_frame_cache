@@ -177,57 +177,57 @@ class OutputProcess(FrigateProcess):
             if not self.config.cameras[camera].enabled:
                 continue
 
-            frame = frame_manager.get(
+            with frame_manager.read(
                 frame_name, self.config.cameras[camera].frame_shape_yuv
-            )
-
-            if frame is None:
-                logger.debug(f"Failed to get frame {frame_name} from SHM")
-                failed_frame_requests[camera] = failed_frame_requests.get(camera, 0) + 1
-
-                if (
-                    failed_frame_requests[camera]
-                    > self.config.cameras[camera].detect.fps
-                ):
-                    logger.warning(
-                        f"Failed to retrieve many frames for {camera} from SHM, consider increasing SHM size if this continues."
+            ) as frame:
+                if frame is None:
+                    logger.debug(f"Failed to get frame {frame_name} from SHM")
+                    failed_frame_requests[camera] = (
+                        failed_frame_requests.get(camera, 0) + 1
                     )
 
-                continue
-            else:
-                failed_frame_requests[camera] = 0
+                    if (
+                        failed_frame_requests[camera]
+                        > self.config.cameras[camera].detect.fps
+                    ):
+                        logger.warning(
+                            f"Failed to retrieve many frames for {camera} from SHM, consider increasing SHM size if this continues."
+                        )
 
-            # send frames for low fps recording
-            preview_recorders[camera].write_data(
-                current_tracked_objects, motion_boxes, frame_time, frame
-            )
-            preview_write_times[camera] = frame_time
+                    continue
+                else:
+                    failed_frame_requests[camera] = 0
+                    frame = frame.buffer
 
-            # send camera frame to ffmpeg process if websockets are connected
-            if any(
-                ws.environ["PATH_INFO"].endswith(camera)
-                for ws in websocket_server.manager
-            ):
-                # write to the converter for the camera if clients are listening to the specific camera
-                jsmpeg_cameras[camera].write_frame(frame.tobytes())
+                # send frames for low fps recording
+                preview_recorders[camera].write_data(
+                    current_tracked_objects, motion_boxes, frame_time, frame
+                )
+                preview_write_times[camera] = frame_time
 
-            # send output data to birdseye if websocket is connected or restreaming
-            if self.config.birdseye.enabled and (
-                self.config.birdseye.restream
-                or any(
-                    ws.environ["PATH_INFO"].endswith("birdseye")
+                # send camera frame to ffmpeg process if websockets are connected
+                if any(
+                    ws.environ["PATH_INFO"].endswith(camera)
                     for ws in websocket_server.manager
-                )
-            ):
-                birdseye.write_data(
-                    camera,
-                    current_tracked_objects,
-                    motion_boxes,
-                    frame_time,
-                    frame,
-                )
+                ):
+                    # write to the converter for the camera if clients are listening to the specific camera
+                    jsmpeg_cameras[camera].write_frame(frame.tobytes())
 
-            frame_manager.close(frame_name)
+                # send output data to birdseye if websocket is connected or restreaming
+                if self.config.birdseye.enabled and (
+                    self.config.birdseye.restream
+                    or any(
+                        ws.environ["PATH_INFO"].endswith("birdseye")
+                        for ws in websocket_server.manager
+                    )
+                ):
+                    birdseye.write_data(
+                        camera,
+                        current_tracked_objects,
+                        motion_boxes,
+                        frame_time,
+                        frame,
+                    )
 
         move_preview_frames("clips")
 
@@ -246,9 +246,6 @@ class OutputProcess(FrigateProcess):
                 regions,
             ) = data
 
-            frame = frame_manager.get(
-                frame_name, self.config.cameras[camera].frame_shape_yuv
-            )
             frame_manager.close(frame_name)
 
         detection_subscriber.stop()

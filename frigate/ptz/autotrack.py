@@ -97,15 +97,18 @@ class PtzMotionEstimator:
                 f"{camera}: Motion estimator running - frame time: {frame_time}"
             )
 
-            yuv_frame = self.frame_manager.get(
-                frame_name, self.camera_config.frame_shape_yuv
-            )
+            # Since motion_estimator() is only reached while inside process_frames(),
+            # where serialized frame cache accesses are guaranteed,
+            # we can safely skip frame_manager's internal synchronization mechanism
+            with self.frame_manager.read(
+                frame_name, self.camera_config.frame_shape_yuv, synchronize=False
+            ) as yuv_frame:
+                if yuv_frame is None:
+                    self.coord_transformations = None
+                    return None
 
-            if yuv_frame is None:
-                self.coord_transformations = None
-                return None
-
-            frame = cv2.cvtColor(yuv_frame, cv2.COLOR_YUV2GRAY_I420)
+                yuv_frame = yuv_frame.buffer
+                frame = cv2.cvtColor(yuv_frame, cv2.COLOR_YUV2GRAY_I420)
 
             # mask out detections for better motion estimation
             mask = np.ones(frame.shape[:2], frame.dtype)
@@ -139,8 +142,6 @@ class PtzMotionEstimator:
                 )
             except Exception:
                 pass
-
-            self.frame_manager.close(frame_name)
 
         return self.coord_transformations
 
