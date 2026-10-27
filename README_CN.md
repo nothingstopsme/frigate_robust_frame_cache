@@ -8,7 +8,7 @@
 <img src="https://hosted.weblate.org/widget/frigate-nvr/-/zh_Hans/svg-badge.svg" alt="翻译状态" />
 </a>
 
-[English](https://github.com/blakeblackshear/frigate) | \[简体中文\]
+[English](https://github.com/blakeblackshear/frigate/blob/dev/README_EN.md) | \[简体中文\]
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
